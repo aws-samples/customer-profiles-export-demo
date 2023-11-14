@@ -1,0 +1,342 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: The template will create the resources needed for the Customer Profiles S3 Export Pipeline
+# Based on https://github.com/amazon-connect/amazon-connect-workshops/blob/main/visualizeConnectData/scripts/ctrPipeline/template.cft
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - 
+        Label: 
+          default: "AWS"
+        Parameters: 
+          - CPDemoDeployBucketName
+          - AmazonConnectInstanceARN
+          - Prefix
+          - CPDemoAuditBucketName
+      - 
+        Label:
+          default: "Salesforce"
+        Parameters:
+          - SFUsername
+          - SFPassword
+          - SFAccessToken
+          - SFHost
+          - SFVersion
+          - SFProduction
+          - SFConsumerKey
+          - SFConsumerSecret
+
+Parameters:
+  AmazonConnectInstanceARN:
+    Type: String
+    Description: Existing Amazon Connect Instance ARN if you have one. Leave empty to create a new instance as [Prefix]-xxxxxxxxxx.
+  
+  Prefix:
+    Description: Prefix for resource names
+    Type: String
+    Default: cpdemo
+
+  CPDemoDeployBucketName:
+    Description: Existing S3 bucket name where the .zip files are copied to (lowercase)
+    Type: String
+
+  CPDemoAuditBucketName:
+    Description: S3 bucket to create for audit logs (lowercase)
+    Type: String
+  
+  SFUsername:
+    Description: SalesForce account username
+    Type: String
+  
+  SFHost:
+    Description: SalesForce hostname
+    Type: String
+
+  SFVersion:
+    Description: SalesForce version
+    Type: String
+
+  SFProduction:
+    Description: Salesforce Production
+    Type: String
+
+  SFPassword:
+    Description: Salesforce password
+    Type: String
+
+  SFAccessToken:
+    Description: Salesforce access token
+    Type: String
+
+  SFConsumerKey:
+    Description: Salesforce consumer key
+    Type: String
+
+  SFConsumerSecret:
+    Description: Salesforce consumer secret
+    Type: String
+
+Conditions:
+  CreateAmazonConnectInstance: !Equals
+    - !Ref AmazonConnectInstanceARN
+    - ""
+
+Resources:
+  CPDemoConnect:
+    Type: AWS::Connect::Instance
+    Condition: CreateAmazonConnectInstance
+    Properties:
+      Attributes:
+        InboundCalls: True
+        OutboundCalls: True
+      IdentityManagementType: "CONNECT_MANAGED"
+      InstanceAlias: !Join
+                        - '-'
+                        - - !Ref Prefix
+                          - !Select
+                              - 4
+                              - !Split
+                                  - '-'
+                                  - !Select
+                                      - 2
+                                      - !Split
+                                          - /
+                                          - !Ref AWS::StackId
+  
+  CPDemoDomain:
+    Type: AWS::CustomerProfiles::Domain
+    Condition: CreateAmazonConnectInstance
+    Properties:
+      DomainName: "CPDemoDomain"
+      DefaultExpirationDays: 30
+
+  CPDemoDomainIntegration:
+    Type: AWS::CustomerProfiles::Integration
+    Condition: CreateAmazonConnectInstance
+    Properties:
+      DomainName: !Ref CPDemoDomain
+      ObjectTypeName: "CTR" 
+      Uri: !Ref CPDemoConnect
+
+  CPDemoAuditBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Join ["", [!Ref Prefix, !Ref CPDemoAuditBucketName]]
+
+  CPDemoUpdateSF:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Ref CPDemoDeployBucketName 
+        S3Key: "lambda.zip"
+      Environment:
+        Variables:
+          LOG_LEVEL: DEBUG
+          SF_USERNAME: !Ref SFUsername
+          SF_HOST: !Ref SFHost
+          SF_VERSION: !Ref SFVersion
+          SF_PRODUCTION: !Ref SFProduction
+          SF_PASSWORD: !Ref SFPassword
+          SF_ACCESS_TOKEN: !Ref SFAccessToken
+          SF_CONSUMER_KEY: !Ref SFConsumerKey
+          SF_CONSUMER_SECRET: !Ref SFConsumerSecret 
+      FunctionName: !Join ["", [!Ref Prefix, CPDemoUpdateSF]]
+      Handler: lambda_function.lambda_handler
+      MemorySize: 128
+      PackageType: Zip
+      Runtime: python3.9
+      Timeout: 60
+      Role: !GetAtt CPDemoUpdateSFRole.Arn
+
+  CPDemoUpdateSFRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Join ["", [!Ref Prefix, CPDemoUpdateSFPolicy]]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*"
+        - PolicyName: !Join ["", [KinesisServicePolicy, !Ref Prefix, CPDemoS3]]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                  - kinesis:ListStreams 
+                Resource: !GetAtt CPDemoKinesisStream.Arn   
+
+  CPDemoKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Join ["", [!Ref Prefix, CPDemo]]
+      RetentionPeriodHours: 24
+      ShardCount: 1
+
+  CPDemoS3Delivery:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Join ["", [!Ref Prefix, CPDemo, S3]]
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt CPDemoKinesisStream.Arn
+        RoleARN: !GetAtt CPDemoS3DeliveryRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt CPDemoAuditBucket.Arn
+        Prefix: CPDemo/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/
+        ErrorOutputPrefix: CPDemoError/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/!{firehose:error-output-type}
+        CompressionFormat: UNCOMPRESSED
+        RoleARN: !GetAtt CPDemoS3DeliveryRole.Arn
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 1
+        S3BackupMode: Enabled
+        S3BackupConfiguration:
+          BucketARN: !GetAtt CPDemoAuditBucket.Arn
+          Prefix: CPDemoBackup/
+          BufferingHints:
+            IntervalInSeconds: 60
+            SizeInMBs: 1
+          CompressionFormat: UNCOMPRESSED
+          RoleARN: !GetAtt CPDemoS3DeliveryRole.Arn
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref CPDemoS3DeliveryLogGroup
+          LogStreamName: !Ref CPDemoS3DeliveryLogStream
+
+  CPDemoS3DeliveryLogGroup:
+    Type: AWS::Logs::LogGroup
+    # Properties:
+    #   LogGroupName: !Join ["", [/aws/kinesis/firehose/, !Ref Prefix, CPDemoS3]]
+
+  CPDemoS3DeliveryLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref CPDemoS3DeliveryLogGroup
+      LogStreamName: S3Delivery
+
+  CPDemoS3DeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Path: /
+      Policies:
+        - PolicyName:
+            !Join ["", [KinesisFirehoseServicePolicy, !Ref Prefix, CPDemoS3]]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt CPDemoAuditBucket.Arn
+                  - !Join ["", [!GetAtt CPDemoAuditBucket.Arn, "/*"]]
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource:
+                  - !Join ["", [!GetAtt CPDemoS3DeliveryLogGroup.Arn, ":*"]]
+        - PolicyName: !Join ["", [KinesisServicePolicy, !Ref Prefix, CPDemoS3]]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                  - kinesis:ListStreams 
+                Resource: !GetAtt CPDemoKinesisStream.Arn  
+                  
+  CPDemoSFEventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      # DestinationConfig:
+      #   OnFailure:
+      #     Destination: arn:aws:sqs:us-east-2:123456789012:dlq
+      #   OnSuccess:
+      #     Destination: arn:aws:sqs:us-east-2:123456789012:dlq
+      FunctionName: !Ref CPDemoUpdateSF
+      MaximumEventAgeInSeconds: 60
+      MaximumRetryAttempts: 2
+      Qualifier: $LATEST
+
+  CPDemoSFEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties: 
+      EventSourceArn: !GetAtt CPDemoKinesisStream.Arn
+      FunctionName: !Ref CPDemoUpdateSF
+      StartingPosition: LATEST
+    DependsOn: 
+      - CPDemoUpdateSFRole
+    
+  CPDemoSFKinesisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Path: /
+
+Outputs:
+  AmazonConnect:
+    Condition: CreateAmazonConnectInstance
+    Value: !Ref CPDemoConnect
+
+  CustomerProfilesDomain:
+    Condition: CreateAmazonConnectInstance
+    Value: !Ref CPDemoDomain
+
+  CPDemoUpdateSF:
+    Value: !Ref CPDemoUpdateSF
+
+  CPDemoKinesisStream:
+    Value: !Ref CPDemoKinesisStream
+
+  CPDemoFirehose:
+    Value: !Ref CPDemoS3Delivery
+
+  CPDemoAuditBucket:
+    Value: !Ref CPDemoAuditBucket
